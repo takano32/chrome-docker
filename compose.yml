@@ -1,0 +1,70 @@
+# 共有 CDP ブラウザ（chromium）を1本だけ常駐させ、chrome-devtools-mcp は
+# それに相乗りする形で使う。どちらのボットもブラウザの起動順に依存しない。
+#
+# ブラウザ: 127.0.0.1:${CDP_PORT} で CDP を待ち受ける（外部には出さない）
+# MCP     : 常駐しない。Hermes から `docker run -i --rm` で都度起動する（stdio）
+name: chrome-docker
+
+services:
+  chrome:
+    build:
+      context: .
+      args:
+        MCP_VERSION: ${MCP_VERSION:-1.12.0}
+    image: chrome-docker:local
+    container_name: chrome-docker
+    restart: unless-stopped
+    # 既定の ENTRYPOINT は MCP なので、ブラウザ役はここで差し替える
+    entrypoint: ["/usr/bin/chromium"]
+    command:
+      - --headless=new
+      # コンテナ内は user namespace が無いので sandbox は切る（外向けではない）
+      - --no-sandbox
+      - --disable-dev-shm-usage
+      - --disable-gpu
+      - --no-first-run
+      - --no-default-browser-check
+      - --disable-background-networking
+      - --disable-extensions
+      - --disable-component-extensions-with-background-pages
+      - --renderer-process-limit=1
+      - --js-flags=--max-old-space-size=256
+      - --remote-debugging-address=127.0.0.1
+      # 内側と外側でポート番号を揃える。Chrome は Host ヘッダのポートが
+      # --remote-debugging-port と違うと接続を切るので、ずらすと繋がらない。
+      - --remote-debugging-port=${CDP_PORT:-9223}
+      - --user-data-dir=/tmp/chrome-profile
+      - --window-size=1440,900
+      - about:blank
+    # ホストのネットワークをそのまま使う。Debian の chromium は
+    # --remote-debugging-address=0.0.0.0 を渡しても 127.0.0.1 にしか束縛せず、
+    # ポート公開（docker-proxy）経由だと接続がリセットされるため。
+    # host network なら 127.0.0.1:${CDP_PORT} がホストとそのまま同じ場所になる。
+    network_mode: host
+    shm_size: "1gb"
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - fetch('http://127.0.0.1:${CDP_PORT:-9223}/json/version').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+  # 常駐させない使い方（Hermes の MCP から呼ぶ）。profiles で `up` の対象から外してある。
+  mcp:
+    profiles: ["mcp"]
+    image: chrome-docker:local
+    stdin_open: true
+    entrypoint: ["chrome-devtools-mcp"]
+    command:
+      - --browserUrl
+      - http://chrome:${CDP_PORT:-9223}
+      - --headless
+      - --isolated
+      - --no-usage-statistics
+    depends_on:
+      chrome:
+        condition: service_healthy

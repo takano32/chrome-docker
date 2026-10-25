@@ -1,18 +1,37 @@
-# 共有 CDP ブラウザ（Google Chrome）を1本だけ常駐させ、chrome-devtools-mcp は
-# それに相乗りする形で使う。どちらのボットもブラウザの起動順に依存しない。
+# chrome-devtools-mcp と headless Google Chrome を1つのイメージに入れ、2つの使い方を用意する。
 #
-# ブラウザ: 127.0.0.1:${CDP_PORT} で CDP を待ち受ける（外部には出さない）
-# MCP     : 常駐しない。Hermes から `docker run -i --rm` で都度起動する（stdio）
+# 既定（profile なし）: `mcp`。MCP の接続1本ごとにコンテナを1つ起こし、その中で MCP が
+#   自分の Chrome を起こす。ポートは開かず、相手からは見えない。抜けると全部消える。
+#   Hermes や nilkani06 の MCP 登録からは compose を介さず `docker run -i --rm ...` で起こす
+#   （README）。compose から試すなら `docker compose run --rm -T mcp`。
+# 任意（profile "shared"）: `chrome`（常駐ブラウザ）と `mcp-shared`（それに相乗りする MCP）。
+#   ログイン状態を残したいときや、1本のブラウザを複数で共有したいとき用。相乗りの性質
+#   （相手のタブもクッキーも見える）は README の「常駐ブラウザに相乗りする」を読んでから。
 name: chrome-docker
 
 services:
-  chrome:
+  mcp:
     build:
       context: .
       args:
-        MCP_VERSION: ${MCP_VERSION:-1.12.0}
-        # 空なら apt の最新。固定したいときだけ .env に CHROME_VERSION を足す（Dockerfile 参照）
+        # どちらも空なら最新。固定したいときだけ .env に書く（Dockerfile 参照）
+        MCP_VERSION: ${MCP_VERSION:-}
         CHROME_VERSION: ${CHROME_VERSION:-}
+    image: chrome-docker:local
+    stdin_open: true
+    # PID 1 を docker-init にして、孤児の回収と SIGTERM の配達を任せる
+    init: true
+    # コンテナ1つ（MCP + Chrome 1本）の天井。1ページの V8 ヒープは CMD の --js-flags で
+    # 512MB に抑えているが、それ以外（レンダラの数、ArrayBuffer、GPU プロセス）はここで止める
+    mem_limit: 2g
+    # 引数は Dockerfile の CMD（--headless --isolated --chromeArg=--no-sandbox ...）。
+    # ネットワークは既定の bridge: 外のサイトには出られ、ホストの 127.0.0.1 には届かない
+    # （0.0.0.0 で待つホストのサービスには docker0 の IP 経由で届く。README「注意」）。
+
+  # ---- 以下は任意（docker compose --profile shared ...）----
+
+  chrome:
+    profiles: ["shared"]
     image: chrome-docker:local
     container_name: chrome-docker
     restart: unless-stopped
@@ -44,7 +63,7 @@ services:
       - --disable-component-extensions-with-background-pages
       # レンダラ数の上限。1 だと全タブが1プロセスに乗り、片方のボットの重いページが
       # もう片方のタブまで巻き込んで落とす。2ボット＋数タブなら 4（1つ増えるごとに
-      # idle で数十MB）。
+      # idle で数十MB）。ただしコンテキストが違うとレンダラを共有できないので固い上限ではない。
       - --renderer-process-limit=4
       # V8 ヒープの上限（レンダラごと）。256 では重い SPA が "Out of Memory" で落ちる
       # ことがあるので 512。全体の天井は下の mem_limit で押さえる。
@@ -82,9 +101,9 @@ services:
       retries: 3
       start_period: 10s
 
-  # 常駐させない使い方（Hermes の MCP から呼ぶ）。profiles で `up` の対象から外してある。
-  mcp:
-    profiles: ["mcp"]
+  # 常駐の chrome に相乗りする MCP（`docker compose --profile shared run --rm -T mcp-shared`）
+  mcp-shared:
+    profiles: ["shared"]
     image: chrome-docker:local
     stdin_open: true
     # chrome は host network に居るので、compose のネットワークからは `chrome` の名前で

@@ -109,6 +109,64 @@ MCP がファイルを書くツール（`take_screenshot` の `filePath`、`perf
   プロセスごとに振られ、同じタブでも相手の MCP では別の番号になる。相手がタブを閉じると
   番号ごと消えるので、操作の前に `list_pages` で引き直す。
 
+### 2つのボットで同時に使うとどうなるか（2026-10-25 実測）
+
+MCP を2本同時に繋ぎ、片方（A）が開いたものをもう片方（B）がどこまで見られ、触れるかを測った。
+`isolatedContext` は**状態の仕切りであって、守りの壁ではない**。
+
+- **B は A の `isolatedContext` のページを読める。**`list_pages` に A のページが
+  `isolated-context-N` の名で出て、その `pageId` を渡せば `evaluate_script` で DOM の文字列も
+  `document.cookie` も取れ、`take_screenshot` で画面も撮れ、`navigate_page` で別の URL へ飛ばせ、
+  `close_page` で閉じられる（全部、MCP のツールだけでできた）。
+- **CDP に直接繋げば、さらに素通し。**127.0.0.1:9223 に繋いだどのプロセスも
+  `Target.getBrowserContexts` で全コンテキストを列挙でき、`Target.attachToTarget` で相手の
+  ページに付け、`Storage.getCookies` に `browserContextId` を渡せば相手のコンテキストの
+  クッキーが返る（実測で A のクッキーが取れた）。`Browser.close` で全部を閉じることもできる。
+- **分かれているもの**: クッキーとストレージ（コンテキストごと）、`emulate` の UA や
+  `resize_page` の大きさ（ページごと。A が自分のページに掛けた上書きは B 自身のページには
+  及ばない。B が A のページを見ると A の上書きが見える）。
+- **ぶつかるもの**: `performance_start_trace` はブラウザ全体で1本。A が録っている間に B が
+  始めると `Tracing has already been started (possibly in another tab)` で失敗する。
+  `lighthouse_audit` も中でトレースを使い、既定で対象ページを reload し、その origin の
+  service worker と cache storage を消してブラウザキャッシュも消す（同梱の Lighthouse の既定。
+  同じ既定コンテキストで同じ origin を使っていれば相手の分も消える。別コンテキストに及ぶかは未検証）。
+- **巻き込まれないもの**: A のページで JS がヒープを食い潰しても（512MB の上限）、B のページは
+  生きていてブラウザも落ちなかった。ただし A 側の MCP はその呼び出しから先が全部タイムアウトに
+  なる（ツールの呼び出しが直列なので、詰まった1件が後ろを塞ぐ）。
+- **ブラウザの再起動**: `docker compose restart chrome` の最中に繋いでいた MCP は、次の呼び出しで
+  自動で繋ぎ直し、`Note: the browser was restarted or reconnected since the last call` を返す。
+  ただし開いていたページもコンテキストもクッキーも全部消える（相手の分も）。
+- `--renderer-process-limit=4` は固い上限ではない。コンテキストが違うとレンダラを共有できないので、
+  コンテキスト5つにページ6枚でレンダラは 10 本になった。
+- 未検証: DNS キャッシュとソケットプールの共有（network service の中なので共有と見ている）、
+  HTTP 認証キャッシュ、ダウンロード先（MCP は `Browser.setDownloadBehavior` を呼ばないので
+  プロファイル既定の場所に落ちると見ている）、`mem_limit` に当たったとき OOM killer が
+  どのプロセスを選ぶか。
+
+**結論。**今の構成は「ブラウザ1本＝信頼の単位1つ」で、2つのボットは互いに全部を読め、
+全部を壊せる。相手のページに書かれた指示（プロンプトインジェクション）が、相手のボットを通して
+こちらのタブを読む・閉じる経路もある。だから、同時に使ってよいのは**公開ページを読むだけで、
+相手に見えて困らない用途**まで。**ログインしたまま使う**（既定コンテキストならクッキーが相手にも
+効く。`isolatedContext` でも CDP 経由で取れる）、**会話の中身を映す URL やページを開く**
+（nilkani06 のチャンネル分離の規則に反する）、**途中で止められては困る長い操作**
+（トレース、Lighthouse、再起動）には使わない。
+
+代替案（トレードオフ付き）:
+
+- **ボットごとに MCP が自分の Chrome を起こす**（chrome-devtools-mcp の既定の形。このイメージなら
+  `docker run -i --rm chrome-docker:local --headless --isolated --chromeArg=--no-sandbox` で、
+  ポートを開けずに pipe で繋ぐ）。相手からは見えないし、落ちても相手に及ばない。代わりに
+  MCP の起動ごとに Chrome も起動し（数秒、200MB 前後）、MCP を抜けると状態も消える。
+  「常駐1本で相乗り」という当初の狙いは捨てることになる。未検証（起動の引数は上流の既定）。
+- **ボットごとにブラウザを常駐させる**（同じイメージで `chrome` サービスを2つ、別ポート、別
+  `user-data-dir`）。プロセスも状態も分かれ、片方の再起動が相手に及ばない。代わりにメモリが
+  2倍で、127.0.0.1 のポートはどちらからも届くので「相手を覗かない」は約束に頼る。
+- **今の1本を `isolatedContext` の約束で使う**（現状）。いちばん軽いが、上に書いたとおり
+  守りは無い。
+- **CDP の前に転送役を置いてコンテキストを強制する**（接続ごとに `browserContextId` を縛る
+  プロキシ）。守りは作れるが、CDP の全メソッドを解釈する自作物になり、版が上がるたびに
+  追従が要る。既製品（browserless など）もあるが未検証。
+
 ## 構成
 
 - `Dockerfile`: `node:22-bookworm-slim` + Google Chrome（Google の apt リポジトリ。署名鍵は

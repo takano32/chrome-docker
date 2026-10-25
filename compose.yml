@@ -11,15 +11,27 @@ services:
       context: .
       args:
         MCP_VERSION: ${MCP_VERSION:-1.12.0}
+        # 空なら apt の最新。固定したいときだけ .env に CHROMIUM_VERSION を足す（Dockerfile 参照）
+        CHROMIUM_VERSION: ${CHROMIUM_VERSION:-}
     image: chrome-docker:local
     container_name: chrome-docker
     restart: unless-stopped
+    # PID 1 を chromium にしない。PID 1 は孤児になった子プロセスを回収する役を負うが
+    # chromium はそれをしないので、落ちたレンダラ等が zombie として残りうる。docker-init
+    # （tini）を挟んで回収と SIGTERM の配達を任せる（`docker stop` が 10 秒待って SIGKILL
+    # になる形も避けられる）。
+    init: true
     # 既定の ENTRYPOINT は MCP なので、ブラウザ役はここで差し替える
     entrypoint: ["/usr/bin/chromium"]
     command:
       - --headless=new
-      # コンテナ内は user namespace が無いので sandbox は切る（外向けではない）
+      # Docker 既定の seccomp が名前空間付きの clone を止めるので chromium の sandbox は
+      # 使えない。chromium-sandbox（setuid 版）を入れて試しても "Failed to move to new
+      # namespace ... Operation not permitted" で落ちる（2026-10-25 実測）。代わりに
+      # 非 root（Dockerfile の USER node）で動かし、CDP は 127.0.0.1 にだけ開ける。
       - --no-sandbox
+      # 共有メモリを /dev/shm でなく /tmp に置く。Debian の /usr/bin/chromium ラッパーも
+      # /dev/shm が 3.8GB 未満なら同じ旗を自分で足すので、shm_size を書いても使われない。
       - --disable-dev-shm-usage
       - --disable-gpu
       - --no-first-run
@@ -27,21 +39,35 @@ services:
       - --disable-background-networking
       - --disable-extensions
       - --disable-component-extensions-with-background-pages
-      - --renderer-process-limit=1
-      - --js-flags=--max-old-space-size=256
+      # レンダラ数の上限。1 だと全タブが1プロセスに乗り、片方のボットの重いページが
+      # もう片方のタブまで巻き込んで落とす。2ボット＋数タブなら 4（1つ増えるごとに
+      # idle で数十MB）。
+      - --renderer-process-limit=4
+      # V8 ヒープの上限（レンダラごと）。256 では重い SPA が "Out of Memory" で落ちる
+      # ことがあるので 512。全体の天井は下の mem_limit で押さえる。
+      - --js-flags=--max-old-space-size=512
+      # chromium 本体（--headless=new）はこの旗を読まず、常に loopback にだけ束縛する
+      # （chrome/browser/devtools/remote_debugging_server.cc）。意図の明示として残す。
       - --remote-debugging-address=127.0.0.1
-      # 内側と外側でポート番号を揃える。Chrome は Host ヘッダのポートが
-      # --remote-debugging-port と違うと接続を切るので、ずらすと繋がらない。
+      # host network なので内側と外側は同じ番号になる
       - --remote-debugging-port=${CDP_PORT:-9223}
       - --user-data-dir=/tmp/chrome-profile
       - --window-size=1440,900
       - about:blank
-    # ホストのネットワークをそのまま使う。Debian の chromium は
-    # --remote-debugging-address=0.0.0.0 を渡しても 127.0.0.1 にしか束縛せず、
-    # ポート公開（docker-proxy）経由だと接続がリセットされるため。
+    # ホストのネットワークをそのまま使う。chromium は 127.0.0.1 にしか束縛しないので、
+    # ポート公開（docker-proxy はコンテナ側の IP に繋ぎに行く）では届かない。
     # host network なら 127.0.0.1:${CDP_PORT} がホストとそのまま同じ場所になる。
+    # 代償: ブラウザで開いたページからホストの 127.0.0.1 のサービスにも届く（README「注意」）。
     network_mode: host
-    shm_size: "1gb"
+    # ブラウザ1本の天井。超えると中で一番大きいプロセス（たいていレンダラ）が OOM で落ち、
+    # ブラウザ本体が落ちたときは restart で戻る。同じ箱に居るボット2体を巻き込まないため。
+    mem_limit: 3g
+    # 常駐なので、ログを無限に溜めない（dbus の警告が起動ごとに 20 行ほど出る）
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
     healthcheck:
       test:
         - CMD
@@ -58,13 +84,21 @@ services:
     profiles: ["mcp"]
     image: chrome-docker:local
     stdin_open: true
+    # chrome は host network に居るので、compose のネットワークからは `chrome` の名前で
+    # 引けない。さらに Chrome は Host ヘッダが IP か localhost でないと 500 を返す
+    # （"Host header is specified and is not an IP address or localhost."）。
+    # こちらも host network に載せて 127.0.0.1 で繋ぐ。
+    network_mode: host
     entrypoint: ["chrome-devtools-mcp"]
     command:
       - --browserUrl
-      - http://chrome:${CDP_PORT:-9223}
-      - --headless
-      - --isolated
+      - http://127.0.0.1:${CDP_PORT:-9223}
+      # --headless / --isolated / --chromeArg は「MCP が Chrome を起こすとき」の引数で、
+      # 繋ぐ形（--browserUrl）では読まれない（BrowserManager.js の #connect）。付けても
+      # 隔離にはならないので書かない。隔離は new_page の isolatedContext で取る（README）。
       - --no-usage-statistics
+      # 性能計測の URL を Google の CrUX API に送らない
+      - --no-performance-crux
     depends_on:
       chrome:
         condition: service_healthy

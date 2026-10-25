@@ -1,7 +1,7 @@
 # chrome-docker
 
 [chrome-devtools-mcp](https://github.com/ChromeDevTools/chrome-devtools-mcp) と、それが喋る相手の
-headless chromium を1つのイメージに入れて、ブラウザだけを compose で常駐させる。
+headless Google Chrome を1つのイメージに入れて、ブラウザだけを compose で常駐させる。
 
 狙いは「ブラウザを1本だけ立てて、複数のボットが CDP で相乗りする」。各自が自分の chrome を
 起動するとプロセスもメモリも二重になり、逆に他人のブラウザに相乗りすると「相手が先に起動して
@@ -9,20 +9,23 @@ headless chromium を1つのイメージに入れて、ブラウザだけを com
 
 本家リポジトリは clone も改変もしない。`npm install -g chrome-devtools-mcp@<版>` で入れるだけ。
 版は `.env` の `MCP_VERSION`（2026-10-25 時点の最新 1.12.0）。
+Chrome は Google の apt リポジトリの `google-chrome-stable`（arm64 版が 2026-10-25 時点で配られている。
+`dists/stable/Release` の `Architectures: amd64 arm64` で確認）。
 
 ## 前提
 
 - docker（この箱は 29.9.2）と compose plugin（v5.6.1 で確認）。
-- イメージは arm64 で作る。Google Chrome の deb は arm64 版が無いので、Debian の chromium を使う。
+- イメージは arm64 で作る。Google の apt リポジトリは amd64 と arm64 の両方を持つので、
+  `dpkg --print-architecture` に合わせて同じ Dockerfile で作れる（amd64 は未検証）。
 
 ## 使い方
 
 ```bash
 cd ~/opt/chrome-docker
-docker compose up -d --build     # 初回はビルド（chromium + MCP）
+docker compose up -d --build     # 初回はビルド（Chrome + MCP）
 docker compose ps
 curl -s http://127.0.0.1:9223/json/version   # CDP が返れば成功
-docker run --rm --entrypoint chromium chrome-docker:local --version   # 入っている chromium の版
+docker run --rm --entrypoint /opt/google/chrome/chrome chrome-docker:local --version   # 入っている Chrome の版
 ```
 
 止める・消す:
@@ -32,8 +35,7 @@ docker compose down            # ブラウザを止める（イメージは残�
 docker compose down --rmi local  # イメージも消す
 ```
 
-chromium のセキュリティ更新を取り込む（apt の層はビルドキャッシュに残るので `--build` だけでは
-更新されない）:
+Chrome の更新を取り込む（apt の層はビルドキャッシュに残るので `--build` だけでは更新されない）:
 
 ```bash
 docker compose build --no-cache && docker compose up -d
@@ -87,10 +89,10 @@ MCP がファイルを書くツール（`take_screenshot` の `filePath`、`perf
 ### 相乗りの作法（共有ブラウザで気をつけること）
 
 ブラウザは1本なので、CDP に繋いだ MCP からは互いのものが見える。2026-10-25 に MCP を2本
-順に繋いで確かめた。
+繋いで確かめた。
 
 - **タブは全員に見える。**`list_pages` に相手のタブも出て、`close_page` で閉じられる
-  （相手が選択中のページを閉じると、相手の次の呼び出しがエラーになる）。
+  （相手が使っているページを閉じると、相手の次の操作が失敗する）。
 - **クッキーとストレージも共有。**既定のコンテキストで片方がログインすると、もう片方も
   ログイン状態で見える。
 - **分けたいときは `new_page` の `isolatedContext` に名前を渡す。**別のブラウザコンテキスト
@@ -103,20 +105,22 @@ MCP がファイルを書くツール（`take_screenshot` の `filePath`、`perf
   ページもコンテキストも閉じない（実測: MCP を抜けたあとも `/json/list` にタブが残る）。
   使い終わったら自分の分を `close_page` する。放っておくとタブが溜まってメモリを食う。
   最後の1枚は閉じられないので、`about:blank` を1枚残す形になる。
-- ページを指す道具は `pageId` を要求する（`--pageIdRouting` が 1.12.0 の既定）。相手が
-  タブを閉じると番号の並びが変わるので、操作の前に `list_pages` で引き直す。
+- ページを指す道具は `pageId` を要求する（`--pageIdRouting` が 1.12.0 の既定）。番号は MCP
+  プロセスごとに振られ、同じタブでも相手の MCP では別の番号になる。相手がタブを閉じると
+  番号ごと消えるので、操作の前に `list_pages` で引き直す。
 
 ## 構成
 
-- `Dockerfile`: `node:22-bookworm-slim` + Debian chromium + `chrome-devtools-mcp`（arm64）。
-  実行ユーザーは `node`（uid 1000）。
+- `Dockerfile`: `node:22-bookworm-slim` + Google Chrome（Google の apt リポジトリ。署名鍵は
+  `/etc/apt/keyrings/google-chrome.asc` に置き `signed-by` でそのリポジトリにだけ使う）
+  + `chrome-devtools-mcp`。実行ユーザーは `node`（uid 1000）。
 - `compose.yml`: `chrome`（常駐、CDP を 127.0.0.1:9223 に公開）と `mcp`（都度起動、stdio）
-- `.env`: `MCP_VERSION` と `CDP_PORT`。chromium の版を固定したいときだけ `CHROMIUM_VERSION`
+- `.env`: `MCP_VERSION` と `CDP_PORT`。Chrome の版を固定したいときだけ `CHROME_VERSION`
   を足す（Dockerfile のコメント参照。既定は空＝apt の最新）
 
 ## 注意（実測で踏んだこと）
 
-- **ホストのネットワークを使っている**（`network_mode: host`）。chromium 本体
+- **ホストのネットワークを使っている**（`network_mode: host`）。Chrome 本体
   （`--headless=new`）は `--remote-debugging-address` を読まず、常に 127.0.0.1（か ::1）に
   だけ束縛する（Chromium の `chrome/browser/devtools/remote_debugging_server.cc`）。ポート公開
   （docker-proxy）はコンテナ側の IP に繋ぎに行くので届かず、接続がリセットされる。host network に
@@ -131,22 +135,31 @@ MCP がファイルを書くツール（`take_screenshot` の `filePath`、`perf
   （`Host: 127.0.0.1:9999` で叩いても 200 が返り、`webSocketDebuggerUrl` もその Host をそのまま
   写す）。
 - **sandbox は切っている**（`--no-sandbox`）。Docker 既定の seccomp が名前空間付きの `clone` を
-  止めるため、Debian の `chromium-sandbox`（setuid 版）を入れて非 root で起こしても
+  止めるため、Chrome 同梱の `chrome-sandbox`（setuid root。`/opt/google/chrome/chrome-sandbox`）
+  があっても、非 root で起こすと
   `Failed to move to new namespace: ... Operation not permitted` で落ちる（2026-10-25 実測）。
   その代わり、コンテナは **root でなく `node`（uid 1000）で動かし**、CDP は 127.0.0.1 にしか
   開けていない。sandbox を生かすなら Docker の seccomp プロファイルを差し替える
   （`security_opt: ["seccomp=<json>"]`）必要があり、未検証。
-- `shm_size` は書かない。Debian の `/usr/bin/chromium` ラッパーが、`/dev/shm` が 3.8GB 未満だと
-  自分で `--disable-dev-shm-usage` を足す（`/etc/chromium.d/` の設定）ので、1GB の shm を
-  用意しても使われない。共有メモリは `/tmp`（overlay）に置かれる。
+- `--disable-dev-shm-usage` を明示している。Docker の `/dev/shm` は既定 64MB で、Chrome の
+  共有メモリには足りない。共有メモリは `/tmp`（overlay）に置かれる。`shm_size` を数 GB にして
+  `/dev/shm` を使わせる手もある。
 - メモリの天井は `mem_limit: 3g`。超えると中の一番大きいプロセス（たいていレンダラ）が OOM で
   落ちる。ブラウザ本体が落ちれば `restart: unless-stopped` で戻るが、タブは消える。
-- 実測（2026-10-25）: イメージ 1.54GB、コンテナのメモリ 165MB、`/json/version` は
-  `Chrome/156.0.8078.47` を返す（bookworm-security の版。bookworm 本体は 150.0.7871.100）。
-  MCP を `docker run -i` でも `docker compose run --rm -T mcp` でも繋ぐと 32 ツールが見えた
-  （`click` / `evaluate_script` / `lighthouse_audit` など）。
+- Chrome の deb の postinst は、自分の apt 設定（`google-chrome.sources`）を足そうとする。
+  `/etc/default/google-chrome` に `repo_add_once="false"` を先に書いて止めてある。署名鍵の写し
+  `/usr/share/keyrings/google-chrome.gpg` は postinst が無条件に置く（害は無い）。
+- 実測（2026-10-25）: イメージ 1.44GB（Debian の chromium で作っていたときは 1.54GB）、
+  コンテナのメモリは idle で 160MB 前後、`/json/version` は `Chrome/156.0.8078.47` を返す
+  （この文字列は Chromium でも同じ。製品名は `navigator.userAgentData.brands` に
+  `Google Chrome` が出ることで見分けた）。MCP を `docker run -i` でも
+  `docker compose run --rm -T mcp` でも繋ぐと 32 ツールが見えた（`click` / `evaluate_script` /
+  `lighthouse_audit` など）。日本語ページのスクリーンショットも豆腐にならない（`fonts-noto-cjk`）。
 - `--user-data-dir` は `/tmp/chrome-profile`。コンテナを作り直すとログイン状態などは消える。
   残したいものが出てきたら named volume に移す。
-- メモリは idle で PSS 270MB 前後（ホスト直実行の同じ構成で実測）。`--renderer-process-limit=4`
-  と `--js-flags=--max-old-space-size=512` は「1 と 256」から上げた。1 だと全タブが1レンダラに
-  乗って片方の重いページがもう片方を巻き込み、256 だと重い SPA で `Out of Memory` になるため。
+- `--renderer-process-limit=4` と `--js-flags=--max-old-space-size=512` は「1 と 256」から上げた。
+  1 だと全タブが1レンダラに乗って片方の重いページがもう片方を巻き込み、256 だと重い SPA で
+  `Out of Memory` になるため。
+- 版の固定: Google のリポジトリも最新版しか置かない（stable / beta / unstable が各1つ）ので、
+  `CHROME_VERSION` で固定した版は次の更新で消え、ビルドが止まる。止めて人が上げる運用なら固定、
+  更新を自動で取り込むなら空のまま（既定）。

@@ -27,6 +27,16 @@ services:
     # 引数は Dockerfile の CMD（--headless --isolated --chromeArg=--no-sandbox ...）。
     # ネットワークは既定の bridge: 外のサイトには出られ、ホストの 127.0.0.1 には届かない
     # （0.0.0.0 で待つホストのサービスには docker0 の IP 経由で届く。README「注意」）。
+    # この接続の Chrome の CDP をホストから使う: entrypoint.sh が CDP_PORT を見て Chrome に
+    # --remote-debugging-port を足し、cdp-forward.js で外向きに出す。ホスト側の番号は Docker に
+    # 選ばせる（127.0.0.1 だけ）。`docker compose run --rm -T --service-ports mcp` で公開され、
+    # 番号は `docker ps --filter label=chrome-docker.owner` か `docker port <名前> 9222` で見る。
+    environment:
+      CDP_PORT: "9222"
+    ports:
+      - "127.0.0.1::9222"
+    labels:
+      chrome-docker.owner: compose
 
   # ---- 以下は任意（docker compose --profile shared ...）----
 

@@ -42,19 +42,24 @@ ARG MCP_VERSION=
 RUN npm install -g "chrome-devtools-mcp@${MCP_VERSION:-latest}" \
  && npm cache clean --force
 
+# 入口のスクリプトと、CDP をホストへ出すときの転送役（どちらも依存なし）
+COPY --chmod=755 entrypoint.sh /usr/local/bin/chrome-docker-entrypoint
+COPY --chmod=644 cdp-forward.js /usr/local/bin/cdp-forward.js
+
 # root では動かさない。--no-sandbox と root が重なると、レンダラが破られたときコンテナの
 # root まで届く。node イメージ付属の非特権ユーザー（uid 1000）で動かす。
 # Chrome も MCP もこのユーザーで動くことは実測済み（user-data-dir は /tmp の下）。
 USER node
 
-# 入口は MCP サーバ（stdio）。引数を渡さなければ CMD の既定＝MCP がコンテナの中で自分の
-# Chrome を起こす（puppeteer が /opt/google/chrome/chrome を見つけるので --executablePath は
-# 要らない。pipe で繋ぐのでポートは開かない）。
+# 入口は entrypoint.sh（引数をそのまま MCP サーバに渡す。環境変数 CDP_PORT があれば、その接続の
+# Chrome の CDP をホストへ出す準備もする）。引数を渡さなければ CMD の既定＝MCP がコンテナの中で
+# 自分の Chrome を起こす（puppeteer が /opt/google/chrome/chrome を見つけるので --executablePath は
+# 要らない。pipe で繋ぐので、CDP_PORT を付けない限りポートは開かない）。
 #   --headless                       画面は無い
 #   --isolated                       使い捨ての user-data-dir（コンテナごと消える）
 #   --chromeArg=--no-sandbox         Docker 既定の seccomp では sandbox が使えない（README「注意」）
 #   --chromeArg=--js-flags=...       1ページが V8 ヒープを食い潰しても 512MB で止める
 #   --no-usage-statistics / --no-performance-crux  Google へ送らない
 # 常駐ブラウザに相乗りするときは、引数を全部渡して差し替える（compose の mcp-shared を参照）。
-ENTRYPOINT ["chrome-devtools-mcp"]
+ENTRYPOINT ["/usr/local/bin/chrome-docker-entrypoint"]
 CMD ["--headless", "--isolated", "--chromeArg=--no-sandbox", "--chromeArg=--js-flags=--max-old-space-size=512", "--no-usage-statistics", "--no-performance-crux"]

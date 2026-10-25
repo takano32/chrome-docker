@@ -50,11 +50,16 @@ MCP サーバは stdio。クライアント（Hermes、Claude Code）がその�
 MCP がコンテナの中で `/opt/google/chrome/chrome` を起こして pipe で繋ぐ（`--executablePath` は要らない）。
 
 ```bash
-docker run -i --rm --init --memory 2g chrome-docker:local
+docker run -i --rm --init --memory 2g \
+  -e CDP_PORT=9222 -p 127.0.0.1::9222 --label chrome-docker.owner=hermes \
+  chrome-docker:local
 ```
 
 - `--init`: PID 1 を docker-init にして、孤児の回収と SIGTERM の配達を任せる。
 - `--memory 2g`: コンテナ（MCP + Chrome 1本）の天井。1ページの V8 ヒープは CMD で 512MB に抑えてある。
+- `-e CDP_PORT=9222 -p 127.0.0.1::9222`: この接続の Chrome の CDP をホストから使う（下の「CDP を
+  ホストから使う」）。要らなければ両方外す。外せばポートは何も開かない。
+- `--label chrome-docker.owner=<呼び出し元>`: 誰の接続かを後から見分けるため（名前は Docker が付ける）。
 - `--shm-size` は要らない（MCP が Chrome に `--disable-dev-shm-usage` を渡す）。`--user` も要らない
   （イメージが `node` で動く）。
 - 足しても動くことを確かめたもの: `--cap-drop ALL --security-opt no-new-privileges --pids-limit 512`。
@@ -64,7 +69,9 @@ Hermes の登録例:
 ```bash
 hermes mcp add chrome-devtools \
   --command docker \
-  --args run -i --rm --init --memory 2g chrome-docker:local
+  --args run -i --rm --init --memory 2g \
+         -e CDP_PORT=9222 -p 127.0.0.1::9222 --label chrome-docker.owner=hermes \
+         chrome-docker:local
 ```
 
 nilkani06 の登録例（`~/.claude.json` の `projects["/home/takano32/nilkani06"].mcpServers`）:
@@ -73,14 +80,63 @@ nilkani06 の登録例（`~/.claude.json` の `projects["/home/takano32/nilkani0
 "chrome-devtools": {
   "type": "stdio",
   "command": "docker",
-  "args": ["run", "-i", "--rm", "--init", "--memory", "2g", "chrome-docker:local"]
+  "args": ["run", "-i", "--rm", "--init", "--memory", "2g",
+           "-e", "CDP_PORT=9222", "-p", "127.0.0.1::9222", "--label", "chrome-docker.owner=nilkani06",
+           "chrome-docker:local"]
 }
 ```
 
-この形では「使い終わったら CDP の `Browser.close` で閉じる」手順も、そのための
-`--chromeArg=--remote-debugging-port=9222` も要らない。MCP が抜けると Chrome もコンテナも消える。
+MCP が抜けると Chrome もコンテナも消える（CDP の口も一緒に消える）ので、終わりの後片付けは要らない。
+セッションの途中で Chrome だけ閉じてメモリを返したいときは、上の口に `Browser.close` を撃つ
+（下の「CDP をホストから使う」）。MCP は生きたまま、次のツール呼び出しで Chrome を起こし直す。
 
-compose から試すなら `docker compose run --rm -T mcp`（同じ既定）。
+compose から試すなら `docker compose run --rm -T --service-ports mcp`（同じ既定。`--service-ports`
+を付けないと CDP の口はホストに出ない）。
+
+### CDP をホストから使う
+
+接続ごとの Chrome は、コンテナの中の 127.0.0.1 にしか待たない。`CDP_PORT` を与えると
+`entrypoint.sh` が Chrome に `--remote-debugging-port=$CDP_PORT` を足し、`cdp-forward.js`
+（node の `net` だけの素通し。依存なし）がコンテナの外向き IP の同じ番号で待って 127.0.0.1 へ流す。
+ホスト側は `-p 127.0.0.1::9222` で受ける。**ホストの番号は Docker が選ぶ**（既定。接続ごとに
+別の番号になるので、何本起こしてもぶつからない）。127.0.0.1 にしか出さないので、箱の外からは触れない。
+
+番号の調べ方:
+
+```bash
+# 誰の接続が、どの番号で待っているか
+docker ps --filter label=chrome-docker.owner \
+  --format '{{.Label "chrome-docker.owner"}}  {{.Names}}  {{.Ports}}'
+#   hermes     thirsty_mayer   127.0.0.1:32768->9222/tcp
+#   nilkani06  zealous_liskov  127.0.0.1:32769->9222/tcp
+
+# 1つの名前から番号だけ
+docker port zealous_liskov 9222        # => 127.0.0.1:32769
+
+curl -s http://127.0.0.1:32769/json/version
+```
+
+Chrome の Host ヘッダ検査（IP か `localhost` 以外は 500）はそのまま効く。ホストから
+`http://127.0.0.1:<番号>` で叩くぶんには通り、`webSocketDebuggerUrl` もその Host（ホスト側の番号）を
+そのまま写すので、返ってきた `ws://127.0.0.1:<番号>/devtools/browser/...` にそのまま繋げる
+（2026-10-25 実測: 2本同時に起こして 32768 と 32769 が振られ、それぞれ `/json/version` が 200、
+ws で繋いで自分のタブとクッキーだけが見え、抜けると口も消えた）。
+
+**途中で Chrome だけ閉じる**（nilkani06 の `mcp.md` §3〜4 の使い方）: この口に `Browser.close` を
+撃つと Chrome のプロセスは全部消え、MCP とコンテナは生きたまま残る。次のツール呼び出しで MCP が
+Chrome を起こし直し（`Note: the browser was restarted or reconnected since the last call` が付く）、
+同じホストの番号で CDP も戻る（`webSocketDebuggerUrl` の GUID は変わるので `/json/version` から
+引き直す）。2026-10-25 実測: Chrome のプロセス 11 → 0、コンテナのメモリ 265MB → 117MB（MCP だけ）、
+一時プロファイルも消え、閉じている間は `/json/version` が接続拒否、起こし直すと 276MB に戻った。
+MCP を止める形（Claude Code は MCP を起こし直さない）を使わずに済むのは、いまの 9222 と同じ。
+
+番号を固定したいときだけ `-p 127.0.0.1:9224:9222` のように書く。固定は1本しか待てないので、
+同じ番号で2本目を起こすと `docker run` が
+`Bind for 127.0.0.1:9224 failed: port is already allocated` で失敗し（exit 125）、その接続は
+MCP ごと立たない。複数のセッションを持つ側（nilkani06）には向かない。
+
+注意: この口に繋いだものは、その接続の Chrome の全部（タブ、クッキー、閉じる）を握れる。
+同じ箱の他のユーザーやプロセスからも 127.0.0.1 経由で繋がる。いまの 9222 と同じ前提。
 
 ### nilkani06 側の置き換え（9222 をこの形に替える手順。まだやっていない）
 
@@ -95,12 +151,21 @@ compose から試すなら `docker compose run --rm -T mcp`（同じ既定）。
 4. 使ってみて `docker ps --filter ancestor=chrome-docker:local` にセッション分のコンテナが出ること、
    セッションが終わると消えることを見る。
 
-閉じ方は変わる。9222 の窓口は要らない。MCP は stdin が閉じる（セッションが終わる）と自分で
-Chrome を閉じ、コンテナは `--rm` で消える（実測: 抜けた直後に `docker ps -a` に残り 0）。
-強制終了は `docker stop <コンテナ>`。コンテナの中で `--chromeArg=--remote-debugging-port=9222`
-を開けても、bridge ではホストから届かない（Chrome は 127.0.0.1 にしか束縛しないので
-`-p` でも届かず、`--network host` が要る）ので、窓口としては使えない。
-`mcp.md` の「`--isolated` を外すとポートが死ぬ」もこの形には関係ない（ポートを使わない）。
+閉じ方は2段ある。セッションの終わりは何もしなくてよい。MCP は stdin が閉じると自分で Chrome を
+閉じ、コンテナは `--rm` で消える（実測: 抜けた直後に `docker ps -a` に残り 0）。
+強制終了は `docker stop <コンテナ>`。
+
+セッションの途中で Chrome だけ閉じてメモリを返す（`mcp.md` §3〜4 で 9222 を使っていた役）は、
+上の「CDP をホストから使う」の口で引き継ぐ。nilkani06 はセッションが何日も続き MCP も同じだけ
+生きるので、この役は要る。手順は、`docker ps --filter label=chrome-docker.owner=nilkani06` か
+`docker port <名前> 9222` で自分の接続の番号を引き、`http://127.0.0.1:<番号>/json/version` の
+`webSocketDebuggerUrl` に `Browser.close` を撃つ。MCP は生きたまま、次のツール呼び出しで Chrome を
+起こし直す（実測済み。上の節）。
+ホストの 9222 に固定したければ `-p 127.0.0.1:9222:9222` と書けるが、固定は1本しか待てず、
+2本目のセッションは MCP ごと立たなくなる（nilkani06 はセッションごとに MCP を1本持つので、固定は
+使わず、番号は毎回引く）。9222 そのものでの実測はしていない（9224、9225 と、動的な番号で確かめた）。
+`mcp.md` の「`--isolated` を外すとポートが死ぬ」はこの形でも同じ理屈だが、CMD に `--isolated` が
+入っているので当たらない。
 
 Claude Code はセッション（委譲先を含む）ごとに MCP を1本持つので、コンテナもその数だけ立つ
 （2026-10-25 時点で bunx の MCP が4本居た＝約 260MB × 4）。いまの形も Chrome を4本起こして
@@ -127,8 +192,11 @@ MCP がファイルを書くツール（`take_screenshot` の `filePath`、`perf
 - 2本同時に起こすと、`list_pages` に相手のページは出ず、クッキーも別、`performance_start_trace`
   は両方同時に録れる。片方のページで JS がヒープを食い潰しても、そのコンテナが自分の天井
   （2GB）に当たるだけで、もう片方は無傷。片方が抜けても相手は無傷。
-- 抜けたあとコンテナは残らない（`--rm`）。Chrome もコンテナと一緒に消える。
+- 抜けたあとコンテナは残らない（`--rm`）。Chrome もコンテナと一緒に消える。CDP の口も消える。
 - 日本語ページのスクリーンショットは豆腐にならない（`fonts-noto-cjk`）。
+- CDP を出した状態（`-e CDP_PORT=9222 -p 127.0.0.1::9222`）でも MCP の動きは同じ。固定番号
+  （9224、9225）と動的な番号（32768、32769）の両方で、ホストから `/json/version` と ws 接続が通った。
+  `Host: <コンテナ名>:9224` のように IP でも localhost でもない Host を付けると 500（Chrome の検査）。
 
 ## 任意: 常駐ブラウザに相乗りする（profile `shared`）
 
@@ -222,8 +290,10 @@ Chrome 版と Debian の chromium 版（同じ 156.0.8078.47）で結果は同�
 
 - `Dockerfile`: `node:24-bookworm-slim` + Google Chrome（Google の apt リポジトリ。署名鍵は
   `/etc/apt/keyrings/google-chrome.asc` に置き `signed-by` でそのリポジトリにだけ使う）
-  + `chrome-devtools-mcp`。実行ユーザーは `node`（uid 1000）。ENTRYPOINT は MCP、CMD は
-  「自分で Chrome を起こす」既定の引数。
+  + `chrome-devtools-mcp`。実行ユーザーは `node`（uid 1000）。ENTRYPOINT は `entrypoint.sh`、
+  CMD は「自分で Chrome を起こす」既定の引数。
+- `entrypoint.sh`: 引数を MCP に渡す。`CDP_PORT` があれば Chrome にポートを足し、`cdp-forward.js` を起こす。
+- `cdp-forward.js`: コンテナの外向き IP から 127.0.0.1 の CDP への素通し（node の `net` のみ）。
 - `compose.yml`: `mcp`（既定。接続ごとに起こす）、`chrome`（profile `shared`。常駐、CDP を
   127.0.0.1:9223 に公開）、`mcp-shared`（profile `shared`。常駐に相乗り）
 - `.env`: `CDP_PORT`（常駐の CDP ポート）。版を固定したいときだけ `CHROME_VERSION` と
@@ -246,8 +316,8 @@ Chrome 版と Debian の chromium 版（同じ 156.0.8078.47）で結果は同�
   止めるため、Chrome 同梱の `chrome-sandbox`（setuid root。`/opt/google/chrome/chrome-sandbox`）
   があっても、非 root で起こすと
   `Failed to move to new namespace: ... Operation not permitted` で落ちる（2026-10-25 実測）。
-  その代わり、コンテナは **root でなく `node`（uid 1000）で動かし**、既定の形ではポートを開けず、
-  常駐でも CDP は 127.0.0.1 にしか開けていない。sandbox を生かすなら Docker の seccomp
+  その代わり、コンテナは **root でなく `node`（uid 1000）で動かし**、CDP はどの形でもホストの
+  127.0.0.1 にしか出さない（接続ごとの形は `CDP_PORT` を付けたときだけ）。sandbox を生かすなら Docker の seccomp
   プロファイルを差し替える（`security_opt: ["seccomp=<json>"]`）必要があり、未検証。
 - `--disable-dev-shm-usage` を使う（既定の形は MCP が渡し、常駐は compose に明示）。Docker の
   `/dev/shm` は既定 64MB で、Chrome の共有メモリには足りない。共有メモリは `/tmp`（overlay）に
